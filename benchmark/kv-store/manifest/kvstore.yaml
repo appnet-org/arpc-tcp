@@ -28,7 +28,7 @@ spec:
       containers:
       - image: appnetorg/kvstore-arpc-tcp:latest
         name: frontend-kvstore-arpc-tcp
-        command: ["/app/frontend/frontend"]
+        command: ["/app/frontend"]
         env:
         - name: LOG_LEVEL
           value: info
@@ -67,7 +67,7 @@ spec:
       containers:
       - image: appnetorg/kvstore-arpc-tcp:latest
         name: kvstore-kvstore-arpc-tcp
-        command: ["/app/kvstore/kvstore"]
+        command: ["/app/kvstore"]
         env:
         - name: LOG_LEVEL
           value: info

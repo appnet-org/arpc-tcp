@@ -16,6 +16,7 @@ WORKDIR /app/benchmark/kv-store
 RUN go mod tidy
 
 # Build binaries
+RUN mkdir -p ./bin
 RUN go build -trimpath -ldflags="-s -w" -o ./bin/frontend ./frontend/frontend.go
 RUN go build -trimpath -ldflags="-s -w" -o ./bin/kvstore ./kvstore/kvstore.go
 
