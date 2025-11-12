@@ -6,20 +6,18 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/appnet-org/arpc-tcp/pkg/logging"
 	"github.com/appnet-org/arpc-tcp/pkg/packet"
+	"github.com/appnet-org/arpc-tcp/pkg/serializer"
 	"github.com/appnet-org/arpc-tcp/pkg/transport"
-	"github.com/appnet-org/arpc/pkg/logging"
-	"github.com/appnet-org/arpc/pkg/metadata"
-	"github.com/appnet-org/arpc/pkg/serializer"
 	"go.uber.org/zap"
 )
 
 // Client represents an RPC client with a transport and serializer.
 type Client struct {
-	transport     *transport.TCPTransport
-	serializer    serializer.Serializer
-	metadataCodec metadata.MetadataCodec
-	defaultAddr   string
+	transport   *transport.TCPTransport
+	serializer  serializer.Serializer
+	defaultAddr string
 }
 
 // NewClient creates a new Client using the given serializer and target address.
@@ -30,10 +28,9 @@ func NewClient(serializer serializer.Serializer, addr string) (*Client, error) {
 		return nil, err
 	}
 	return &Client{
-		transport:     t,
-		serializer:    serializer,
-		metadataCodec: metadata.MetadataCodec{},
-		defaultAddr:   addr,
+		transport:   t,
+		serializer:  serializer,
+		defaultAddr: addr,
 	}, nil
 }
 
@@ -52,10 +49,10 @@ func (c *Client) Transport() *transport.TCPTransport {
 }
 
 // frameRequest constructs a binary message with
-// [serviceLen(2B)][service][methodLen(2B)][method][metadataLen(2B)][metadata][payload]
-func (c *Client) frameRequest(service, method string, metadataBytes, payload []byte) ([]byte, error) {
-	// Pre-calculate buffer size (headers: 2 + 2 + 2 = 6 bytes)
-	totalSize := 6 + len(service) + len(method) + len(metadataBytes) + len(payload)
+// [serviceLen(2B)][service][methodLen(2B)][method][payload]
+func (c *Client) frameRequest(service, method string, payload []byte) ([]byte, error) {
+	// Pre-calculate buffer size (headers: 2 + 2 = 4 bytes)
+	totalSize := 4 + len(service) + len(method) + len(payload)
 	buf := make([]byte, totalSize)
 
 	// service
@@ -67,13 +64,8 @@ func (c *Client) frameRequest(service, method string, metadataBytes, payload []b
 	binary.LittleEndian.PutUint16(buf[methodStart:methodStart+2], uint16(len(method)))
 	copy(buf[methodStart+2:], method)
 
-	// metadata
-	metadataStart := methodStart + 2 + len(method)
-	binary.LittleEndian.PutUint16(buf[metadataStart:metadataStart+2], uint16(len(metadataBytes)))
-	copy(buf[metadataStart+2:], metadataBytes)
-
 	// payload
-	payloadStart := metadataStart + 2 + len(metadataBytes)
+	payloadStart := methodStart + 2 + len(method)
 	copy(buf[payloadStart:], payload)
 
 	return buf, nil
@@ -110,7 +102,7 @@ func (c *Client) parseFramedResponse(data []byte) (service string, method string
 	return service, method, payload, nil
 }
 
-func (c *Client) handleErrorPacket(ctx context.Context, errMsg string, errType packet.PacketTypeID) error {
+func (c *Client) handleErrorPacket(errMsg string, errType packet.PacketTypeID) error {
 	var rpcErrType RPCErrorType
 	if errType == packet.PacketTypeError {
 		rpcErrType = RPCFailError
@@ -120,7 +112,7 @@ func (c *Client) handleErrorPacket(ctx context.Context, errMsg string, errType p
 	return &RPCError{Type: rpcErrType, Reason: errMsg}
 }
 
-func (c *Client) handleResponsePacket(ctx context.Context, data []byte, rpcID uint64, resp any) error {
+func (c *Client) handleResponsePacket(data []byte, rpcID uint64, resp any) error {
 	// Parse framed response: extract service, method, payload
 	_, _, respPayloadBytes, err := c.parseFramedResponse(data)
 	if err != nil {
@@ -141,18 +133,6 @@ func (c *Client) handleResponsePacket(ctx context.Context, data []byte, rpcID ui
 func (c *Client) Call(ctx context.Context, service, method string, req any, resp any) error {
 	rpcReqID := transport.GenerateRPCID()
 
-	// Extract metadata from context
-	md := metadata.FromOutgoingContext(ctx)
-	var metadataBytes []byte
-	var err error
-	if len(md) > 0 {
-		metadataBytes, err = c.metadataCodec.EncodeHeaders(md)
-		if err != nil {
-			return fmt.Errorf("failed to encode metadata: %w", err)
-		}
-		logging.Debug("Encoded metadata", zap.String("metadata", fmt.Sprintf("%x", metadataBytes)))
-	}
-
 	// Serialize the request payload
 	reqPayloadBytes, err := c.serializer.Marshal(req)
 	if err != nil {
@@ -160,7 +140,7 @@ func (c *Client) Call(ctx context.Context, service, method string, req any, resp
 	}
 
 	// Frame the request into binary format
-	framedReq, err := c.frameRequest(service, method, metadataBytes, reqPayloadBytes)
+	framedReq, err := c.frameRequest(service, method, reqPayloadBytes)
 	if err != nil {
 		return fmt.Errorf("failed to frame request: %w", err)
 	}
@@ -191,9 +171,9 @@ func (c *Client) Call(ctx context.Context, service, method string, req any, resp
 		// Process the packet based on its type
 		switch packetTypeID {
 		case packet.PacketTypeData:
-			return c.handleResponsePacket(ctx, data, respID, resp)
+			return c.handleResponsePacket(data, respID, resp)
 		case packet.PacketTypeError, packet.PacketTypeUnknown:
-			return c.handleErrorPacket(ctx, string(data), packetTypeID)
+			return c.handleErrorPacket(string(data), packetTypeID)
 		default:
 			logging.Debug("Ignoring packet with unknown type", zap.Uint8("packetTypeID", uint8(packetTypeID)))
 			continue
