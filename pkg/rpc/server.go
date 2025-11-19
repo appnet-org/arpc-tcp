@@ -133,8 +133,8 @@ func (s *Server) Start() {
 	}
 }
 
-// handleConnection handles a single TCP connection
-func (s *Server) handleConnection(conn *net.TCPConn) {
+// handleConnection handles a single TCP or TLS connection
+func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	// Create a transport instance for this connection

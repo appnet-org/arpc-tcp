@@ -1,0 +1,137 @@
+# TLS-enabled KV Store deployment for Kubernetes
+#
+# Prerequisites:
+# 1. Generate TLS certificates using the generate-certs.sh script:
+#    DOMAIN=kvstore.default.svc.cluster.local \
+#    ADDITIONAL_DOMAINS='kvstore,kvstore.default,kvstore.default.svc' \
+#    CERT_DIR=./benchmark/kv-store/certs \
+#    ./scripts/generate-certs.sh
+#
+# 2. Create the Kubernetes secret from the generated certificates:
+#    kubectl create secret generic kvstore-tls-certs \
+#      --from-file=ca-cert.pem=./benchmark/kv-store/certs/ca-cert.pem \
+#      --from-file=server-cert.pem=./benchmark/kv-store/certs/server-cert.pem \
+#      --from-file=server-key.pem=./benchmark/kv-store/certs/server-key.pem \
+#      --from-file=client-cert.pem=./benchmark/kv-store/certs/client-cert.pem \
+#      --from-file=client-key.pem=./benchmark/kv-store/certs/client-key.pem
+#
+# 3. Deploy this manifest:
+#    kubectl apply -f manifest/kvstore-tls.yaml
+#
+# To update certificates (e.g., after expiration), regenerate them and update the secret:
+#    kubectl create secret generic kvstore-tls-certs \
+#      --from-file=ca-cert.pem=./benchmark/kv-store/certs/ca-cert.pem \
+#      --from-file=server-cert.pem=./benchmark/kv-store/certs/server-cert.pem \
+#      --from-file=server-key.pem=./benchmark/kv-store/certs/server-key.pem \
+#      --from-file=client-cert.pem=./benchmark/kv-store/certs/client-cert.pem \
+#      --from-file=client-key.pem=./benchmark/kv-store/certs/client-key.pem \
+#      --dry-run=client -o yaml | kubectl apply -f -
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels:
+    app: frontend
+spec:
+  clusterIP: 10.96.88.88
+  ports:
+  - name: frontend
+    port: 80
+    targetPort: 8080
+  selector:
+    app: frontend
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  replicas: 1
+  template:
+    metadata:
+      name: frontend
+      labels:
+        app: frontend
+    spec:
+      containers:
+      - image: appnetorg/kvstore-arpc-tcp:latest
+        name: frontend-kvstore-arpc-tcp
+        command: ["/app/frontend"]
+        env:
+        - name: LOG_LEVEL
+          value: info
+        # TLS Client Configuration
+        - name: ARPC_TLS_ENABLED
+          value: "true"
+        - name: ARPC_TLS_CA_FILE
+          value: "/app/certs/ca-cert.pem"
+        # Optional: Use ARPC_TLS_SKIP_VERIFY=true for testing without proper CA verification
+        # - name: ARPC_TLS_SKIP_VERIFY
+        #   value: "true"
+        volumeMounts:
+        - name: tls-certs
+          mountPath: /app/certs
+          readOnly: true
+      volumes:
+      - name: tls-certs
+        secret:
+          secretName: kvstore-tls-certs
+  selector:
+    matchLabels:
+      app: frontend
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kvstore
+  labels:
+    app: kvstore
+spec:
+  clusterIP: None
+  ports:
+  - name: kvstore
+    port: 11000
+    protocol: TCP  # Changed from UDP to TCP for TLS
+    targetPort: 11000
+  selector:
+    app: kvstore
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kvstore
+spec:
+  replicas: 1
+  template:
+    metadata:
+      name: kvstore
+      labels:
+        app: kvstore
+    spec:
+      containers:
+      - image: appnetorg/kvstore-arpc-tcp:latest
+        name: kvstore-kvstore-arpc-tcp
+        command: ["/app/kvstore"]
+        env:
+        - name: LOG_LEVEL
+          value: info
+        # TLS Server Configuration
+        - name: ARPC_TLS_ENABLED
+          value: "true"
+        - name: ARPC_TLS_CERT_FILE
+          value: "/app/certs/server-cert.pem"
+        - name: ARPC_TLS_KEY_FILE
+          value: "/app/certs/server-key.pem"
+        volumeMounts:
+        - name: tls-certs
+          mountPath: /app/certs
+          readOnly: true
+      volumes:
+      - name: tls-certs
+        secret:
+          secretName: kvstore-tls-certs
+  selector:
+    matchLabels:
+      app: kvstore
+

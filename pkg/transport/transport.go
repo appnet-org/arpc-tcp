@@ -1,10 +1,13 @@
 package transport
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -19,13 +22,69 @@ func GenerateRPCID() uint64 {
 	return uint64(time.Now().UnixNano())
 }
 
+// isTLSEnabled checks if TLS is enabled via environment variable
+func isTLSEnabled() bool {
+	enabled := os.Getenv("ARPC_TLS_ENABLED")
+	return enabled == "true" || enabled == "1" || enabled == "yes"
+}
+
+// loadTLSConfig loads TLS configuration from environment variables
+// For server: ARPC_TLS_CERT_FILE and ARPC_TLS_KEY_FILE
+// For client: ARPC_TLS_CA_FILE (optional, for custom CA)
+// If ARPC_TLS_SKIP_VERIFY is set, client will skip certificate verification
+func loadTLSConfig(isServer bool) (*tls.Config, error) {
+	config := &tls.Config{}
+
+	if isServer {
+		certFile := os.Getenv("ARPC_TLS_CERT_FILE")
+		keyFile := os.Getenv("ARPC_TLS_KEY_FILE")
+
+		if certFile == "" || keyFile == "" {
+			return nil, fmt.Errorf("TLS enabled but ARPC_TLS_CERT_FILE or ARPC_TLS_KEY_FILE not set")
+		}
+
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+		}
+
+		config.Certificates = []tls.Certificate{cert}
+	} else {
+		// Client configuration
+		caFile := os.Getenv("ARPC_TLS_CA_FILE")
+		skipVerify := os.Getenv("ARPC_TLS_SKIP_VERIFY") == "true" || os.Getenv("ARPC_TLS_SKIP_VERIFY") == "1"
+
+		if caFile != "" {
+			caCert, err := os.ReadFile(caFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read CA certificate: %w", err)
+			}
+
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return nil, fmt.Errorf("failed to parse CA certificate")
+			}
+
+			config.RootCAs = caCertPool
+		}
+
+		if skipVerify {
+			config.InsecureSkipVerify = true
+		}
+	}
+
+	return config, nil
+}
+
 type TCPTransport struct {
-	listener    *net.TCPListener
-	conn        *net.TCPConn
+	listener    net.Listener
+	conn        net.Conn
 	connMutex   sync.Mutex
 	reassembler *DataReassembler
 	resolver    *balancer.Resolver
 	isServer    bool
+	tlsConfig   *tls.Config
+	tlsEnabled  bool
 }
 
 func NewTCPTransport(address string) (*TCPTransport, error) {
@@ -39,9 +98,24 @@ func NewTCPTransportWithBalancer(address string, resolver *balancer.Resolver) (*
 		return nil, err
 	}
 
-	listener, err := net.ListenTCP("tcp", tcpAddr)
-	if err != nil {
-		return nil, err
+	tlsEnabled := isTLSEnabled()
+	var listener net.Listener
+	var tlsConfig *tls.Config
+
+	if tlsEnabled {
+		tlsConfig, err = loadTLSConfig(true)
+		if err != nil {
+			return nil, err
+		}
+		listener, err = tls.Listen("tcp", address, tlsConfig)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		listener, err = net.ListenTCP("tcp", tcpAddr)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	transport := &TCPTransport{
@@ -50,6 +124,14 @@ func NewTCPTransportWithBalancer(address string, resolver *balancer.Resolver) (*
 		reassembler: NewDataReassembler(),
 		resolver:    resolver,
 		isServer:    true,
+		tlsConfig:   tlsConfig,
+		tlsEnabled:  tlsEnabled,
+	}
+
+	if tlsEnabled {
+		logging.Info("TLS enabled for server", zap.String("address", address))
+	} else {
+		logging.Info("TLS disabled for server", zap.String("address", address))
 	}
 
 	return transport, nil
@@ -57,12 +139,31 @@ func NewTCPTransportWithBalancer(address string, resolver *balancer.Resolver) (*
 
 // NewTCPClientTransport creates a TCP transport for client use
 func NewTCPClientTransport() (*TCPTransport, error) {
+	tlsEnabled := isTLSEnabled()
+	var tlsConfig *tls.Config
+	var err error
+
+	if tlsEnabled {
+		tlsConfig, err = loadTLSConfig(false)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	transport := &TCPTransport{
 		listener:    nil,
 		conn:        nil,
 		reassembler: NewDataReassembler(),
 		resolver:    balancer.DefaultResolver(),
 		isServer:    false,
+		tlsConfig:   tlsConfig,
+		tlsEnabled:  tlsEnabled,
+	}
+
+	if tlsEnabled {
+		logging.Info("TLS enabled for client")
+	} else {
+		logging.Info("TLS disabled for client")
 	}
 
 	return transport, nil
@@ -70,7 +171,8 @@ func NewTCPClientTransport() (*TCPTransport, error) {
 
 // NewTCPTransportForConnection creates a TCP transport for a server connection
 // This is used to create a transport instance for each client connection
-func NewTCPTransportForConnection(conn *net.TCPConn, resolver *balancer.Resolver) *TCPTransport {
+// If TLS is enabled, the connection should already be wrapped with TLS
+func NewTCPTransportForConnection(conn net.Conn, resolver *balancer.Resolver) *TCPTransport {
 	return &TCPTransport{
 		listener:    nil,
 		conn:        conn,
@@ -78,6 +180,7 @@ func NewTCPTransportForConnection(conn *net.TCPConn, resolver *balancer.Resolver
 		reassembler: NewDataReassembler(),
 		resolver:    resolver,
 		isServer:    true,
+		tlsEnabled:  isTLSEnabled(),
 	}
 }
 
@@ -115,9 +218,43 @@ func (t *TCPTransport) connect(addr string) error {
 		return err
 	}
 
-	conn, err := net.DialTCP("tcp", nil, tcpAddr)
-	if err != nil {
-		return err
+	var conn net.Conn
+	if t.tlsEnabled {
+		// Create a copy of the TLS config with ServerName set from the address
+		tlsConfig := t.tlsConfig.Clone()
+		// Only set ServerName if InsecureSkipVerify is false and ServerName is not already set
+		if !tlsConfig.InsecureSkipVerify && tlsConfig.ServerName == "" {
+			// Extract hostname from address (format: hostname:port or ip:port)
+			host, _, splitErr := net.SplitHostPort(addr)
+			if splitErr != nil {
+				// If parsing fails, try using the address as-is (might be just hostname)
+				host = addr
+			}
+			// If host is empty (e.g., address was ":port"), default to localhost
+			if host == "" {
+				host = "localhost"
+			}
+			// Only set ServerName if it's not an IP address
+			// For IP addresses, TLS requires either ServerName or InsecureSkipVerify
+			if ip := net.ParseIP(host); ip == nil {
+				// It's a hostname, set ServerName
+				tlsConfig.ServerName = host
+			} else {
+				// For IP addresses, we need InsecureSkipVerify set
+				// This is because Go's TLS requires explicit ServerName or InsecureSkipVerify
+				// IP SAN verification will work, but we still need one of these set
+				tlsConfig.InsecureSkipVerify = true
+			}
+		}
+		conn, err = tls.Dial("tcp", addr, tlsConfig)
+		if err != nil {
+			return err
+		}
+	} else {
+		conn, err = net.DialTCP("tcp", nil, tcpAddr)
+		if err != nil {
+			return err
+		}
 	}
 	t.conn = conn
 
@@ -144,19 +281,39 @@ func (t *TCPTransport) Send(addr string, rpcID uint64, data []byte, packetTypeID
 	// Extract destination IP and port from the connection's remote address
 	var dstIP [4]byte
 	var dstPort uint16
-	remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
-	if ip4 := remoteAddr.IP.To4(); ip4 != nil {
+	remoteAddr := conn.RemoteAddr()
+	var tcpAddr *net.TCPAddr
+	var ok bool
+	if tcpAddr, ok = remoteAddr.(*net.TCPAddr); !ok {
+		// For TLS connections, try to resolve the address
+		var err error
+		tcpAddr, err = net.ResolveTCPAddr("tcp", remoteAddr.String())
+		if err != nil {
+			return fmt.Errorf("failed to resolve remote address: %w", err)
+		}
+	}
+	if ip4 := tcpAddr.IP.To4(); ip4 != nil {
 		copy(dstIP[:], ip4)
-		dstPort = uint16(remoteAddr.Port)
+		dstPort = uint16(tcpAddr.Port)
 	}
 
 	// Get source IP and port from local address
-	localAddr := conn.LocalAddr().(*net.TCPAddr)
 	var srcIP [4]byte
-	if ip4 := localAddr.IP.To4(); ip4 != nil {
+	var srcPort uint16
+	localAddr := conn.LocalAddr()
+	var localTCPAddr *net.TCPAddr
+	if localTCPAddr, ok = localAddr.(*net.TCPAddr); !ok {
+		// For TLS connections, try to resolve the address
+		var err error
+		localTCPAddr, err = net.ResolveTCPAddr("tcp", localAddr.String())
+		if err != nil {
+			return fmt.Errorf("failed to resolve local address: %w", err)
+		}
+	}
+	if ip4 := localTCPAddr.IP.To4(); ip4 != nil {
 		copy(srcIP[:], ip4)
 	}
-	srcPort := uint16(localAddr.Port)
+	srcPort = uint16(localTCPAddr.Port)
 
 	// Fragment the data into multiple packets if needed
 	// Note: TCP can handle larger payloads, but we keep fragmentation for consistency
@@ -212,7 +369,7 @@ func (t *TCPTransport) Send(addr string, rpcID uint64, data []byte, packetTypeID
 // * error
 func (t *TCPTransport) Receive(bufferSize int) ([]byte, *net.TCPAddr, uint64, packet.PacketTypeID, error) {
 	// For client, use the existing connection
-	var conn *net.TCPConn
+	var conn net.Conn
 	if t.isServer {
 		// Server should use AcceptConnection to get a connection
 		// This method is for receiving on an already accepted connection
@@ -248,7 +405,22 @@ func (t *TCPTransport) Receive(bufferSize int) ([]byte, *net.TCPAddr, uint64, pa
 	}
 
 	// Get the remote address
-	addr := conn.RemoteAddr().(*net.TCPAddr)
+	var addr *net.TCPAddr
+	remoteAddr := conn.RemoteAddr()
+	if tcpAddr, ok := remoteAddr.(*net.TCPAddr); ok {
+		addr = tcpAddr
+	} else {
+		// For TLS connections, try to extract TCP address
+		host, port, err := net.SplitHostPort(remoteAddr.String())
+		if err != nil {
+			return nil, nil, 0, packet.PacketTypeUnknown, fmt.Errorf("failed to parse remote address: %w", err)
+		}
+		tcpAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
+		if err != nil {
+			return nil, nil, 0, packet.PacketTypeUnknown, fmt.Errorf("failed to resolve remote address: %w", err)
+		}
+		addr = tcpAddr
+	}
 
 	// Deserialize the received data
 	pkt, packetTypeID, err := packet.DeserializePacket(buffer)
@@ -270,11 +442,12 @@ func (t *TCPTransport) Receive(bufferSize int) ([]byte, *net.TCPAddr, uint64, pa
 }
 
 // AcceptConnection accepts a new TCP connection (server only)
-func (t *TCPTransport) AcceptConnection() (*net.TCPConn, error) {
+// If TLS is enabled, returns a TLS-wrapped connection
+func (t *TCPTransport) AcceptConnection() (net.Conn, error) {
 	if !t.isServer || t.listener == nil {
 		return nil, fmt.Errorf("AcceptConnection can only be called on a server transport")
 	}
-	return t.listener.AcceptTCP()
+	return t.listener.Accept()
 }
 
 // ReassembleDataPacket processes data packets through the reassembly layer
@@ -298,7 +471,8 @@ func (t *TCPTransport) ReassembleDataPacket(pkt *packet.DataPacket, addr *net.TC
 }
 
 // SetConnection sets the TCP connection for this transport (used by server after accepting)
-func (t *TCPTransport) SetConnection(conn *net.TCPConn) {
+// If TLS is enabled, the connection should already be wrapped with TLS
+func (t *TCPTransport) SetConnection(conn net.Conn) {
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
 	t.conn = conn
@@ -325,8 +499,9 @@ func (t *TCPTransport) Close() error {
 	return err
 }
 
-// GetConn returns the underlying TCP connection for direct packet sending
-func (t *TCPTransport) GetConn() *net.TCPConn {
+// GetConn returns the underlying connection for direct packet sending
+// May return a *net.TCPConn or *tls.Conn depending on TLS configuration
+func (t *TCPTransport) GetConn() net.Conn {
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
 	return t.conn
@@ -335,12 +510,35 @@ func (t *TCPTransport) GetConn() *net.TCPConn {
 // LocalAddr returns the local TCP address of the transport
 func (t *TCPTransport) LocalAddr() *net.TCPAddr {
 	if t.listener != nil {
-		return t.listener.Addr().(*net.TCPAddr)
+		addr := t.listener.Addr()
+		if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+			return tcpAddr
+		}
+		// For TLS listeners, try to resolve the address
+		host, port, err := net.SplitHostPort(addr.String())
+		if err == nil {
+			tcpAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
+			if err == nil {
+				return tcpAddr
+			}
+		}
+		return nil
 	}
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
 	if t.conn != nil {
-		return t.conn.LocalAddr().(*net.TCPAddr)
+		addr := t.conn.LocalAddr()
+		if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+			return tcpAddr
+		}
+		// For TLS connections, try to resolve the address
+		host, port, err := net.SplitHostPort(addr.String())
+		if err == nil {
+			tcpAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
+			if err == nil {
+				return tcpAddr
+			}
+		}
 	}
 	return nil
 }

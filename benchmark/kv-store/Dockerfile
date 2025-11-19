@@ -35,6 +35,9 @@ RUN apt-get update && \
 COPY --from=builder /app/benchmark/kv-store/bin/frontend /app/frontend
 COPY --from=builder /app/benchmark/kv-store/bin/kvstore /app/kvstore
 
+# Create certs directory for TLS certificates
+RUN mkdir -p /app/certs
+
 # Make binaries executable
 RUN chmod +x /app/frontend /app/kvstore
 
