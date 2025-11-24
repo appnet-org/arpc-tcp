@@ -9,6 +9,7 @@ import (
 	kv "github.com/appnet-org/arpc-tcp/benchmark/kv-store/symphony"
 	"github.com/appnet-org/arpc-tcp/pkg/logging"
 	"github.com/appnet-org/arpc-tcp/pkg/rpc"
+	"github.com/appnet-org/arpc-tcp/pkg/rpc/element"
 	"github.com/appnet-org/arpc-tcp/pkg/serializer"
 	"go.uber.org/zap"
 )
@@ -133,7 +134,7 @@ func main() {
 	}
 
 	serializer := &serializer.SymphonySerializer{}
-	server, err := rpc.NewServer(":11000", serializer)
+	server, err := rpc.NewServer(":11000", serializer, nil)
 	if err != nil {
 		logging.Fatal("Failed to start server", zap.Error(err))
 	}
@@ -149,23 +150,71 @@ func main() {
 	kvServer := NewKVServer(maxSize)
 
 	// Manually register the service with arpc-tcp's server
-	// Create handlers that adapt arpc-tcp's simpler interface to the server implementation
-	getHandler := func(srv any, ctx context.Context, dec func(any) error) (resp any, err error) {
+	// Create handlers that match the new element-aware interface
+	getHandler := func(srv any, ctx context.Context, dec func(any) error, rpcReq *element.RPCRequest, chain *element.RPCElementChain) (*element.RPCResponse, context.Context, error) {
 		req := new(kv.GetRequest)
 		if err := dec(req); err != nil {
-			return nil, err
+			return nil, ctx, err
 		}
-		result, _, err := srv.(kv.KVServiceServer).Get(ctx, req)
-		return result, err
+
+		// Set the payload in rpcReq for element processing
+		rpcReq.Payload = req
+
+		// Process request through element chain
+		rpcReq, ctx, err := chain.ProcessRequest(ctx, rpcReq)
+		if err != nil {
+			return nil, ctx, err
+		}
+
+		// Call the actual service method
+		result, ctx, err := srv.(kv.KVServiceServer).Get(ctx, rpcReq.Payload.(*kv.GetRequest))
+		if err != nil {
+			return nil, ctx, err
+		}
+
+		// Create response
+		rpcResp := &element.RPCResponse{
+			ID:     rpcReq.ID,
+			Result: result,
+			Error:  nil,
+		}
+
+		// Process response through element chain
+		rpcResp, ctx, err = chain.ProcessResponse(ctx, rpcResp)
+		return rpcResp, ctx, err
 	}
 
-	setHandler := func(srv any, ctx context.Context, dec func(any) error) (resp any, err error) {
+	setHandler := func(srv any, ctx context.Context, dec func(any) error, rpcReq *element.RPCRequest, chain *element.RPCElementChain) (*element.RPCResponse, context.Context, error) {
 		req := new(kv.SetRequest)
 		if err := dec(req); err != nil {
-			return nil, err
+			return nil, ctx, err
 		}
-		result, _, err := srv.(kv.KVServiceServer).Set(ctx, req)
-		return result, err
+
+		// Set the payload in rpcReq for element processing
+		rpcReq.Payload = req
+
+		// Process request through element chain
+		rpcReq, ctx, err := chain.ProcessRequest(ctx, rpcReq)
+		if err != nil {
+			return nil, ctx, err
+		}
+
+		// Call the actual service method
+		result, ctx, err := srv.(kv.KVServiceServer).Set(ctx, rpcReq.Payload.(*kv.SetRequest))
+		if err != nil {
+			return nil, ctx, err
+		}
+
+		// Create response
+		rpcResp := &element.RPCResponse{
+			ID:     rpcReq.ID,
+			Result: result,
+			Error:  nil,
+		}
+
+		// Process response through element chain
+		rpcResp, ctx, err = chain.ProcessResponse(ctx, rpcResp)
+		return rpcResp, ctx, err
 	}
 
 	server.RegisterService(&rpc.ServiceDesc{

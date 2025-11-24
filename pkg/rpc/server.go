@@ -8,6 +8,7 @@ import (
 	"net"
 
 	"github.com/appnet-org/arpc-tcp/pkg/packet"
+	"github.com/appnet-org/arpc-tcp/pkg/rpc/element"
 	"github.com/appnet-org/arpc-tcp/pkg/transport"
 	"github.com/appnet-org/arpc/pkg/logging"
 	"github.com/appnet-org/arpc/pkg/serializer"
@@ -15,7 +16,7 @@ import (
 )
 
 // MethodHandler defines the function signature for handling an RPC method.
-type MethodHandler func(srv any, ctx context.Context, dec func(any) error) (resp any, err error)
+type MethodHandler func(srv any, ctx context.Context, dec func(any) error, req *element.RPCRequest, chain *element.RPCElementChain) (resp *element.RPCResponse, newCtx context.Context, err error)
 
 // MethodDesc represents an RPC service's method specification.
 type MethodDesc struct {
@@ -32,21 +33,23 @@ type ServiceDesc struct {
 
 // Server is the core RPC server handling transport, serialization, and registered services.
 type Server struct {
-	transport  *transport.TCPTransport
-	serializer serializer.Serializer
-	services   map[string]*ServiceDesc
+	transport       *transport.TCPTransport
+	serializer      serializer.Serializer
+	services        map[string]*ServiceDesc
+	rpcElementChain *element.RPCElementChain
 }
 
 // NewServer initializes a new Server instance with the given address and serializer.
-func NewServer(addr string, serializer serializer.Serializer) (*Server, error) {
+func NewServer(addr string, serializer serializer.Serializer, rpcElements []element.RPCElement) (*Server, error) {
 	tcpTransport, err := transport.NewTCPTransport(addr)
 	if err != nil {
 		return nil, err
 	}
 	return &Server{
-		transport:  tcpTransport,
-		serializer: serializer,
-		services:   make(map[string]*ServiceDesc),
+		transport:       tcpTransport,
+		serializer:      serializer,
+		services:        make(map[string]*ServiceDesc),
+		rpcElementChain: element.NewRPCElementChain(rpcElements...),
 	}, nil
 }
 
@@ -169,27 +172,34 @@ func (s *Server) handleConnection(conn net.Conn) {
 		// Create context
 		ctx := context.Background()
 
+		// Create RPC request for element processing
+		rpcReq := &element.RPCRequest{
+			ID:          rpcID,
+			ServiceName: serviceName,
+			Method:      methodName,
+		}
+
 		// Lookup service and method
-		svcDesc, ok := s.services[serviceName]
+		svcDesc, ok := s.services[rpcReq.ServiceName]
 		if !ok {
-			logging.Warn("Unknown service", zap.String("serviceName", serviceName))
+			logging.Warn("Unknown service", zap.String("serviceName", rpcReq.ServiceName))
 			if err := connTransport.Send(addr.String(), rpcID, []byte("unknown service"), packet.PacketTypeError); err != nil {
 				logging.Error("Error sending error response", zap.Error(err))
 			}
 			continue
 		}
-		methodDesc, ok := svcDesc.Methods[methodName]
+		methodDesc, ok := svcDesc.Methods[rpcReq.Method]
 		if !ok {
 			logging.Warn("Unknown method",
-				zap.String("serviceName", serviceName),
-				zap.String("methodName", methodName))
+				zap.String("serviceName", rpcReq.ServiceName),
+				zap.String("methodName", rpcReq.Method))
 			continue
 		}
 
-		// Invoke method handler
-		resp, err := methodDesc.Handler(svcDesc.ServiceImpl, ctx, func(v any) error {
+		// Invoke method handler with element chain
+		rpcResp, _, err := methodDesc.Handler(svcDesc.ServiceImpl, ctx, func(v any) error {
 			return s.serializer.Unmarshal(reqPayloadBytes, v)
-		})
+		}, rpcReq, s.rpcElementChain)
 		if err != nil {
 			var errType packet.PacketTypeID
 			if rpcErr, ok := err.(*RPCError); ok && rpcErr.Type == RPCFailError {
@@ -205,7 +215,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 
 		// Serialize response
-		respPayloadBytes, err := s.serializer.Marshal(resp)
+		respPayloadBytes, err := s.serializer.Marshal(rpcResp.Result)
 		if err != nil {
 			logging.Error("Error marshaling response", zap.Error(err))
 			if err := connTransport.Send(addr.String(), rpcID, []byte(err.Error()), packet.PacketTypeUnknown); err != nil {
