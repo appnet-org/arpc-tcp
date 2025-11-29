@@ -30,7 +30,9 @@ func isTLSEnabled() bool {
 
 // loadTLSConfig loads TLS configuration from environment variables
 // For server: ARPC_TLS_CERT_FILE and ARPC_TLS_KEY_FILE
+// For mTLS server: ARPC_TLS_CA_FILE (required to verify client certificates)
 // For client: ARPC_TLS_CA_FILE (optional, for custom CA)
+// For mTLS client: ARPC_TLS_CLIENT_CERT_FILE and ARPC_TLS_CLIENT_KEY_FILE
 // If ARPC_TLS_SKIP_VERIFY is set, client will skip certificate verification
 func loadTLSConfig(isServer bool) (*tls.Config, error) {
 	config := &tls.Config{}
@@ -49,6 +51,23 @@ func loadTLSConfig(isServer bool) (*tls.Config, error) {
 		}
 
 		config.Certificates = []tls.Certificate{cert}
+
+		// mTLS: Configure client certificate verification
+		caFile := os.Getenv("ARPC_TLS_CA_FILE")
+		if caFile != "" {
+			caCert, err := os.ReadFile(caFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read CA certificate for client verification: %w", err)
+			}
+
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return nil, fmt.Errorf("failed to parse CA certificate for client verification")
+			}
+
+			config.ClientCAs = caCertPool
+			config.ClientAuth = tls.RequireAndVerifyClientCert
+		}
 	} else {
 		// Client configuration
 		caFile := os.Getenv("ARPC_TLS_CA_FILE")
@@ -70,6 +89,19 @@ func loadTLSConfig(isServer bool) (*tls.Config, error) {
 
 		if skipVerify {
 			config.InsecureSkipVerify = true
+		}
+
+		// mTLS: Load client certificate for mutual authentication
+		clientCertFile := os.Getenv("ARPC_TLS_CLIENT_CERT_FILE")
+		clientKeyFile := os.Getenv("ARPC_TLS_CLIENT_KEY_FILE")
+
+		if clientCertFile != "" && clientKeyFile != "" {
+			clientCert, err := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load client certificate: %w", err)
+			}
+
+			config.Certificates = []tls.Certificate{clientCert}
 		}
 	}
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"os"
 	"strconv"
 	"sync"
@@ -127,13 +128,68 @@ func getLoggingConfig() *logging.Config {
 }
 
 func main() {
+	// Command-line flags for mTLS configuration
+	var (
+		enableMTLS    = flag.Bool("mtls", false, "Enable mutual TLS (mTLS) authentication")
+		tlsEnabled    = flag.Bool("tls", false, "Enable TLS (one-way or mTLS)")
+		tlsCertFile   = flag.String("tls-cert-file", "", "Path to server certificate file (required for TLS)")
+		tlsKeyFile    = flag.String("tls-key-file", "", "Path to server private key file (required for TLS)")
+		tlsCAFile     = flag.String("tls-ca-file", "", "Path to CA certificate file (required for mTLS to verify client certs)")
+		listenAddr    = flag.String("listen", ":11000", "Address to listen on")
+	)
+	flag.Parse()
+
 	// Initialize logging with configuration from environment variables
 	if err := logging.Init(getLoggingConfig()); err != nil {
 		panic(err)
 	}
 
+	// Configure TLS/mTLS from flags or environment variables
+	// Flags take precedence over environment variables
+	if *tlsEnabled || *enableMTLS {
+		os.Setenv("ARPC_TLS_ENABLED", "true")
+	}
+
+	if *tlsCertFile != "" {
+		os.Setenv("ARPC_TLS_CERT_FILE", *tlsCertFile)
+	} else if *tlsEnabled || *enableMTLS {
+		// If TLS is enabled but cert file not provided via flag, check environment
+		if os.Getenv("ARPC_TLS_CERT_FILE") == "" {
+			logging.Fatal("TLS enabled but no server certificate specified. Use -tls-cert-file flag or ARPC_TLS_CERT_FILE env var")
+		}
+	}
+
+	if *tlsKeyFile != "" {
+		os.Setenv("ARPC_TLS_KEY_FILE", *tlsKeyFile)
+	} else if *tlsEnabled || *enableMTLS {
+		// If TLS is enabled but key file not provided via flag, check environment
+		if os.Getenv("ARPC_TLS_KEY_FILE") == "" {
+			logging.Fatal("TLS enabled but no server key specified. Use -tls-key-file flag or ARPC_TLS_KEY_FILE env var")
+		}
+	}
+
+	if *enableMTLS {
+		// mTLS requires CA file for client certificate verification
+		if *tlsCAFile != "" {
+			os.Setenv("ARPC_TLS_CA_FILE", *tlsCAFile)
+		} else if os.Getenv("ARPC_TLS_CA_FILE") == "" {
+			logging.Fatal("mTLS enabled but no CA file specified. Use -tls-ca-file flag or ARPC_TLS_CA_FILE env var")
+		}
+
+		logging.Info("mTLS enabled for server",
+			zap.String("cert_file", os.Getenv("ARPC_TLS_CERT_FILE")),
+			zap.String("key_file", os.Getenv("ARPC_TLS_KEY_FILE")),
+			zap.String("ca_file", os.Getenv("ARPC_TLS_CA_FILE")),
+		)
+	} else if *tlsEnabled {
+		logging.Info("TLS enabled for server (one-way)",
+			zap.String("cert_file", os.Getenv("ARPC_TLS_CERT_FILE")),
+			zap.String("key_file", os.Getenv("ARPC_TLS_KEY_FILE")),
+		)
+	}
+
 	serializer := &serializer.SymphonySerializer{}
-	server, err := rpc.NewServer(":11000", serializer)
+	server, err := rpc.NewServer(*listenAddr, serializer)
 	if err != nil {
 		logging.Fatal("Failed to start server", zap.Error(err))
 	}

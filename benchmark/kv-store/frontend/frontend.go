@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -119,14 +120,69 @@ func handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Command-line flags for mTLS configuration
+	var (
+		enableMTLS        = flag.Bool("mtls", false, "Enable mutual TLS (mTLS) authentication")
+		tlsEnabled        = flag.Bool("tls", false, "Enable TLS (one-way or mTLS)")
+		tlsCAFile         = flag.String("tls-ca-file", "", "Path to CA certificate file (for verifying server cert)")
+		tlsClientCertFile = flag.String("tls-client-cert-file", "", "Path to client certificate file (required for mTLS)")
+		tlsClientKeyFile  = flag.String("tls-client-key-file", "", "Path to client private key file (required for mTLS)")
+		tlsSkipVerify     = flag.Bool("tls-skip-verify", false, "Skip server certificate verification (testing only)")
+		serverAddr        = flag.String("server", "kvstore.default.svc.cluster.local:11000", "Server address to connect to")
+	)
+	flag.Parse()
+
 	err := logging.Init(getLoggingConfig())
 	if err != nil {
 		panic(fmt.Sprintf("Failed to initialize logging: %v", err))
 	}
 
+	// Configure TLS/mTLS from flags or environment variables
+	// Flags take precedence over environment variables
+	if *tlsEnabled || *enableMTLS {
+		os.Setenv("ARPC_TLS_ENABLED", "true")
+	}
+
+	if *tlsCAFile != "" {
+		os.Setenv("ARPC_TLS_CA_FILE", *tlsCAFile)
+	} else if *tlsEnabled || *enableMTLS {
+		// If TLS is enabled but CA file not provided via flag, check environment
+		if os.Getenv("ARPC_TLS_CA_FILE") == "" {
+			logging.Warn("TLS enabled but no CA file specified. Use -tls-ca-file flag or ARPC_TLS_CA_FILE env var")
+		}
+	}
+
+	if *enableMTLS {
+		// mTLS requires client certificates
+		if *tlsClientCertFile != "" {
+			os.Setenv("ARPC_TLS_CLIENT_CERT_FILE", *tlsClientCertFile)
+		} else if os.Getenv("ARPC_TLS_CLIENT_CERT_FILE") == "" {
+			logging.Fatal("mTLS enabled but no client certificate specified. Use -tls-client-cert-file flag or ARPC_TLS_CLIENT_CERT_FILE env var")
+		}
+
+		if *tlsClientKeyFile != "" {
+			os.Setenv("ARPC_TLS_CLIENT_KEY_FILE", *tlsClientKeyFile)
+		} else if os.Getenv("ARPC_TLS_CLIENT_KEY_FILE") == "" {
+			logging.Fatal("mTLS enabled but no client key specified. Use -tls-client-key-file flag or ARPC_TLS_CLIENT_KEY_FILE env var")
+		}
+
+		logging.Info("mTLS enabled for client",
+			zap.String("ca_file", os.Getenv("ARPC_TLS_CA_FILE")),
+			zap.String("client_cert", os.Getenv("ARPC_TLS_CLIENT_CERT_FILE")),
+			zap.String("client_key", os.Getenv("ARPC_TLS_CLIENT_KEY_FILE")),
+		)
+	} else if *tlsEnabled {
+		logging.Info("TLS enabled for client (one-way)",
+			zap.String("ca_file", os.Getenv("ARPC_TLS_CA_FILE")),
+		)
+	}
+
+	if *tlsSkipVerify {
+		os.Setenv("ARPC_TLS_SKIP_VERIFY", "true")
+	}
+
 	serializer := &serializer.SymphonySerializer{}
-	// client, err := rpc.NewClient(serializer, ":11000")
-	client, err := rpc.NewClient(serializer, "kvstore.default.svc.cluster.local:11000")
+	client, err := rpc.NewClient(serializer, *serverAddr)
 	if err != nil {
 		logging.Fatal("Failed to create RPC client", zap.Error(err))
 	}
