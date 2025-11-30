@@ -9,7 +9,7 @@ iptables-restore <<'EOF'
 
 ### --- EXCLUSIONS (prevent infinite loops & preserve system traffic) ---
 
-# 1. Do NOT intercept proxy’s own traffic
+# 1. Do NOT intercept proxy's own traffic
 -A OUTPUT -m owner --uid-owner 1337 -j RETURN
 
 # 2. Do NOT intercept loopback (prevents hairpin loops)

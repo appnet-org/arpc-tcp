@@ -33,11 +33,23 @@ The proxy follows the same architecture as `proxy-h2` but operates on raw TCP st
 To use with iptables REDIRECT, configure rules like this:
 
 ```bash
-# Redirect incoming TCP traffic on port 8080 to proxy port 15002
-iptables -t nat -A PREROUTING -p tcp --dport 8080 -j REDIRECT --to-port 15002
+# Create a system user named 'proxyuser' with no login shell
+sudo useradd -r -s /usr/sbin/nologin proxyuser
 
-# Redirect outgoing TCP traffic on port 8080 to proxy port 15002
-iptables -t nat -A OUTPUT -p tcp --dport 8080 -j REDIRECT --to-port 15002
+# 1. Intercept traffic COMING INTO the server (from outside)
+# Traffic destined for port 11000 -> Redirect to 15002
+sudo iptables -t nat -A PREROUTING -p tcp --dport 11000 -j REDIRECT --to-port 15002
+
+# 2. Intercept traffic STARTING FROM this server (local apps)
+# Traffic destined for port 11000 -> Redirect to 15002
+# !!! CRITICAL: exclude traffic from 'proxyuser' !!!
+sudo iptables -t nat -A OUTPUT -p tcp --dport 11000 -m owner ! --uid-owner proxyuser -j REDIRECT --to-port 15002
+```
+
+## Quick Verification
+
+```bash
+sudo iptables -t nat -L -n -v | grep 15002
 ```
 
 ## Configuration
@@ -62,10 +74,20 @@ go build -o proxy-tcp .
 
 ```bash
 # Run with iptables interception (recommended)
-./proxy-tcp
+sudo -u proxyuser ./proxy-tcp -tls -tls-cert-file=../benchmark/kv-store/certs/server-cert.pem -tls-key-file=../benchmark/kv-store/certs/server-key.pem
+```
 
-# Run with fallback target address
-TARGET_ADDR=localhost:8080 ./proxy-tcp
+## Cleanup
+
+```bash
+# 1. Delete the OUTBOUND rule
+sudo iptables -t nat -D OUTPUT -p tcp --dport 11000 -m owner ! --uid-owner proxyuser -j REDIRECT --to-port 15002
+
+# 2. Delete the INBOUND rule
+sudo iptables -t nat -D PREROUTING -p tcp --dport 11000 -j REDIRECT --to-port 15002
+
+# 3. (Optional) Delete the user if you don't need it anymore
+sudo userdel proxyuser
 ```
 
 ## Element Chain

@@ -14,6 +14,9 @@ cd /users/xzhu/arpc-tcp
 
 # Generate certificates in the kv-store certs directory
 CERT_DIR=./benchmark/kv-store/certs ./scripts/generate-certs.sh
+# Make sure the proxyuser can use this file
+chmod 644 ./benchmark/kv-store/certs/server-key.pem
+chmod 644 ./benchmark/kv-store/certs/server-cert.pem
 ```
 
 This will create:

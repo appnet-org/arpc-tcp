@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -38,6 +40,10 @@ type ProxyState struct {
 type Config struct {
 	Ports      []int
 	TargetAddr string
+	// TLS Configuration
+	TLSEnabled bool
+	CertFile   string
+	KeyFile    string
 }
 
 // DefaultConfig returns the default proxy configuration
@@ -150,10 +156,38 @@ func (s *ProxyState) getNextConnectionID() string {
 }
 
 func main() {
+	var (
+		enableMTLS  = flag.Bool("mtls", false, "Enable mutual TLS (treated same as -tls for proxy termination)")
+		tlsEnabled  = flag.Bool("tls", false, "Enable TLS termination")
+		tlsCertFile = flag.String("tls-cert-file", "", "Server cert file (for decrypting incoming)")
+		tlsKeyFile  = flag.String("tls-key-file", "", "Server key file (for decrypting incoming)")
+	)
+	flag.Parse()
+
 	// Initialize logging
 	err := logging.Init(getLoggingConfig())
 	if err != nil {
 		panic(fmt.Sprintf("Failed to initialize logging: %v", err))
+	}
+
+	// 2. Populate Config
+	config := &Config{
+		Ports:      []int{15002, 15006},
+		TargetAddr: os.Getenv("TARGET_ADDR"),
+		TLSEnabled: *tlsEnabled || *enableMTLS,
+		CertFile:   *tlsCertFile,
+		KeyFile:    *tlsKeyFile,
+	}
+
+	if config.TLSEnabled {
+		if config.CertFile == "" || config.KeyFile == "" {
+			logging.Fatal("TLS enabled but cert/key missing. Use -tls-cert-file and -tls-key-file")
+		}
+		logging.Info("TLS Termination Enabled",
+			zap.String("cert", config.CertFile),
+			zap.String("key", config.KeyFile))
+	} else {
+		logging.Info("TLS Termination DISABLED (Blind Forwarding)")
 	}
 
 	logging.Info("Starting bidirectional TCP proxy on :15002 and :15006...")
@@ -162,8 +196,6 @@ func main() {
 	elementChain := element.NewRPCElementChain(
 	// element.NewLoggingElement(true), // Enable verbose logging if needed
 	)
-
-	config := DefaultConfig()
 
 	state := &ProxyState{
 		elementChain: elementChain,
@@ -191,7 +223,7 @@ func startProxyServers(config *Config, state *ProxyState) error {
 		wg.Add(1)
 		go func(p int) {
 			defer wg.Done()
-			if err := runProxyServer(p, state); err != nil {
+			if err := runProxyServer(p, state, config); err != nil {
 				errCh <- fmt.Errorf("proxy server on port %d failed: %w", p, err)
 			}
 		}(port)
@@ -211,7 +243,7 @@ func startProxyServers(config *Config, state *ProxyState) error {
 }
 
 // runProxyServer runs a single TCP proxy server on the specified port
-func runProxyServer(port int, state *ProxyState) error {
+func runProxyServer(port int, state *ProxyState, config *Config) error {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return fmt.Errorf("failed to listen on TCP port %d: %w", port, err)
@@ -227,12 +259,12 @@ func runProxyServer(port int, state *ProxyState) error {
 			continue
 		}
 
-		go handleConnection(clientConn, state)
+		go handleConnection(clientConn, state, config)
 	}
 }
 
 // handleConnection processes a TCP connection and forwards traffic
-func handleConnection(clientConn net.Conn, state *ProxyState) {
+func handleConnection(clientConn net.Conn, state *ProxyState, config *Config) {
 	defer clientConn.Close()
 
 	connID := state.getNextConnectionID()
@@ -241,7 +273,7 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 		zap.String("clientAddr", clientConn.RemoteAddr().String()),
 		zap.String("localAddr", clientConn.LocalAddr().String()))
 
-	// Get the original destination from iptables interception
+	// 1. Get Original Destination (Always done on raw connection)
 	targetAddr := state.targetAddr
 	if origDst, ok := getOriginalDestination(clientConn); ok {
 		targetAddr = origDst
@@ -255,39 +287,61 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 		return
 	}
 
-	// Connect to the real target; this creates a brand new upstream TCP session
-	// so the proxy can sit between client and destination.
-	targetConn, err := net.Dial("tcp", targetAddr)
-	if err != nil {
-		logging.Warn("Failed to connect to target",
-			zap.String("connID", connID),
-			zap.String("target", targetAddr),
-			zap.String("clientAddr", clientConn.RemoteAddr().String()),
-			zap.String("localAddr", clientConn.LocalAddr().String()),
-			zap.Error(err))
-		return
+	// Define the abstract connections we will use
+	var inboundConn net.Conn = clientConn
+	var outboundConn net.Conn
+
+	// 2. LOGIC SWITCH: TLS Termination vs Blind Forwarding
+	if config.TLSEnabled {
+		// --- MODE A: TLS TERMINATION (Decrypt -> Process -> Encrypt) ---
+
+		// A. Upgrade Inbound (Client -> Proxy) to TLS Server
+		cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
+		if err != nil {
+			logging.Error("Failed to load certs", zap.Error(err))
+			return
+		}
+		inboundConn = tls.Server(clientConn, &tls.Config{Certificates: []tls.Certificate{cert}})
+
+		// B. Connect Outbound (Proxy -> Target) as TLS Client
+		// InsecureSkipVerify=true for testing (matches your dev environment)
+		outboundConn, err = tls.Dial("tcp", targetAddr, &tls.Config{InsecureSkipVerify: true})
+		if err != nil {
+			logging.Warn("Failed to connect to target (TLS)", zap.Error(err))
+			return
+		}
+
+		logging.Info("Proxying with TLS Termination (Plaintext inspection active)", zap.String("connID", connID))
+
+	} else {
+		// --- MODE B: BLIND FORWARDING (Forward Raw Bytes) ---
+		// If app uses TLS, these bytes will be encrypted "garbage"
+
+		var err error
+		outboundConn, err = net.Dial("tcp", targetAddr)
+		if err != nil {
+			logging.Warn("Failed to connect to target (TCP)", zap.Error(err))
+			return
+		}
+
+		logging.Info("Proxying Raw TCP (Blind Forwarding)", zap.String("connID", connID))
 	}
-	defer targetConn.Close()
 
-	logging.Debug("Connected to target",
-		zap.String("connID", connID),
-		zap.String("target", targetAddr))
+	defer outboundConn.Close()
 
+	// 3. Start Bi-directional Stream
 	ctx := context.Background()
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Handle client -> target (requests)
 	go func() {
 		defer wg.Done()
-		handleTCPStream(clientConn, targetConn, state, ctx, true, connID, targetAddr)
+		handleTCPStream(inboundConn, outboundConn, state, ctx, true, connID, targetAddr)
 	}()
 
-	// Handle target -> client (responses)
 	go func() {
 		defer wg.Done()
-		handleTCPStream(targetConn, clientConn, state, ctx, false, connID, targetAddr)
+		handleTCPStream(outboundConn, inboundConn, state, ctx, false, connID, targetAddr)
 	}()
 
 	wg.Wait()
@@ -368,7 +422,8 @@ func handleTCPStream(srcConn net.Conn, dstConn io.Writer, state *ProxyState, ctx
 		logging.Debug("Received TCP data",
 			zap.String("connID", connID),
 			zap.String("direction", direction),
-			zap.Int("dataLen", n))
+			zap.Int("dataLen", n),
+			zap.String("payload", string(data)))
 
 		// Process through element chain
 		verdict, processedData, shouldForward := processDataThroughElementChain(
@@ -404,7 +459,8 @@ func handleTCPStream(srcConn net.Conn, dstConn io.Writer, state *ProxyState, ctx
 			logging.Debug("Forwarded TCP data",
 				zap.String("connID", connID),
 				zap.String("direction", direction),
-				zap.Int("dataLen", len(processedData)))
+				zap.Int("dataLen", len(processedData)),
+				zap.String("payload", string(processedData)))
 		}
 	}
 }

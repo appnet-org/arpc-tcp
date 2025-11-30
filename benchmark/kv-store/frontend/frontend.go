@@ -189,8 +189,8 @@ func main() {
 	kvClient = &arpcTCPKVServiceClient{client: client}
 
 	http.HandleFunc("/", handler)
-	logging.Info("HTTP server listening", zap.String("addr", ":8080"))
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	logging.Info("HTTP server listening", zap.String("addr", "localhost:8080"))
+	if err := http.ListenAndServe("localhost:8080", nil); err != nil {
 		logging.Fatal("HTTP server failed", zap.Error(err))
 	}
 }
