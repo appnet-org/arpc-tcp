@@ -14,8 +14,9 @@ iptables-restore <<'EOF'
 # 1. Do NOT intercept proxy's own traffic
 -A OUTPUT -m owner --uid-owner proxyuser -j RETURN
 
-# 2. Do NOT intercept loopback (prevents hairpin loops)
--A OUTPUT -o lo -j RETURN
+# 2. Do NOT intercept loopback to proxy ports (prevents hairpin loops)
+-A OUTPUT -o lo -p tcp --dport 15002 -j RETURN
+-A OUTPUT -o lo -p tcp --dport 15006 -j RETURN
 
 # 3. Do NOT intercept DNS (recommended)
 -A OUTPUT -p udp --dport 53 -j RETURN

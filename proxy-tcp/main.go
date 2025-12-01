@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -41,9 +42,13 @@ type Config struct {
 	Ports      []int
 	TargetAddr string
 	// TLS Configuration
-	TLSEnabled bool
-	CertFile   string
-	KeyFile    string
+	TLSEnabled     bool
+	CertFile       string // Server cert for inbound (proxy acts as server)
+	KeyFile        string // Server key for inbound
+	CAFile         string // CA cert for mTLS (verify clients)
+	ClientCertFile string // Client cert for outbound (proxy acts as client)
+	ClientKeyFile  string // Client key for outbound
+	TLSSkipVerify  bool   // Skip server certificate verification on outbound
 }
 
 // DefaultConfig returns the default proxy configuration
@@ -147,6 +152,21 @@ func getLoggingConfig() *logging.Config {
 	}
 }
 
+// loadCAPool loads CA certificates from a file into a cert pool
+func loadCAPool(caFile string) (*x509.CertPool, error) {
+	caCert, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA file: %w", err)
+	}
+
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("failed to parse CA certificate")
+	}
+
+	return caPool, nil
+}
+
 // getNextConnectionID generates a unique connection ID
 func (s *ProxyState) getNextConnectionID() string {
 	s.connMu.Lock()
@@ -157,10 +177,14 @@ func (s *ProxyState) getNextConnectionID() string {
 
 func main() {
 	var (
-		enableMTLS  = flag.Bool("mtls", false, "Enable mutual TLS (treated same as -tls for proxy termination)")
-		tlsEnabled  = flag.Bool("tls", false, "Enable TLS termination")
-		tlsCertFile = flag.String("tls-cert-file", "", "Server cert file (for decrypting incoming)")
-		tlsKeyFile  = flag.String("tls-key-file", "", "Server key file (for decrypting incoming)")
+		enableMTLS        = flag.Bool("mtls", false, "Enable mutual TLS (requires CA and client cert/key for full mTLS support)")
+		tlsEnabled        = flag.Bool("tls", false, "Enable TLS termination")
+		tlsCertFile       = flag.String("tls-cert-file", "", "Server cert file (for decrypting incoming)")
+		tlsKeyFile        = flag.String("tls-key-file", "", "Server key file (for decrypting incoming)")
+		tlsCAFile         = flag.String("tls-ca-file", "", "CA cert file (for verifying client certs in mTLS)")
+		tlsClientCertFile = flag.String("tls-client-cert-file", "", "Client cert file (for authenticating to upstream in mTLS)")
+		tlsClientKeyFile  = flag.String("tls-client-key-file", "", "Client key file (for authenticating to upstream in mTLS)")
+		tlsSkipVerify     = flag.Bool("tls-skip-verify", true, "Skip server certificate verification on outbound connections (insecure, for testing only)")
 	)
 	flag.Parse()
 
@@ -172,20 +196,38 @@ func main() {
 
 	// 2. Populate Config
 	config := &Config{
-		Ports:      []int{15002, 15006},
-		TargetAddr: os.Getenv("TARGET_ADDR"),
-		TLSEnabled: *tlsEnabled || *enableMTLS,
-		CertFile:   *tlsCertFile,
-		KeyFile:    *tlsKeyFile,
+		Ports:          []int{15002, 15006},
+		TargetAddr:     os.Getenv("TARGET_ADDR"),
+		TLSEnabled:     *tlsEnabled || *enableMTLS,
+		CertFile:       *tlsCertFile,
+		KeyFile:        *tlsKeyFile,
+		CAFile:         *tlsCAFile,
+		ClientCertFile: *tlsClientCertFile,
+		ClientKeyFile:  *tlsClientKeyFile,
+		TLSSkipVerify:  *tlsSkipVerify,
 	}
 
 	if config.TLSEnabled {
 		if config.CertFile == "" || config.KeyFile == "" {
 			logging.Fatal("TLS enabled but cert/key missing. Use -tls-cert-file and -tls-key-file")
 		}
-		logging.Info("TLS Termination Enabled",
-			zap.String("cert", config.CertFile),
-			zap.String("key", config.KeyFile))
+
+		isMTLS := config.CAFile != "" || (config.ClientCertFile != "" && config.ClientKeyFile != "")
+
+		if isMTLS {
+			logging.Info("mTLS Termination Enabled",
+				zap.String("server_cert", config.CertFile),
+				zap.String("server_key", config.KeyFile),
+				zap.String("ca_file", config.CAFile),
+				zap.String("client_cert", config.ClientCertFile),
+				zap.String("client_key", config.ClientKeyFile),
+				zap.Bool("skip_verify", config.TLSSkipVerify))
+		} else {
+			logging.Info("TLS Termination Enabled (one-way)",
+				zap.String("cert", config.CertFile),
+				zap.String("key", config.KeyFile),
+				zap.Bool("skip_verify", config.TLSSkipVerify))
+		}
 	} else {
 		logging.Info("TLS Termination DISABLED (Blind Forwarding)")
 	}
@@ -296,16 +338,47 @@ func handleConnection(clientConn net.Conn, state *ProxyState, config *Config) {
 		// --- MODE A: TLS TERMINATION (Decrypt -> Process -> Encrypt) ---
 
 		// A. Upgrade Inbound (Client -> Proxy) to TLS Server
-		cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
+		serverCert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
 		if err != nil {
-			logging.Error("Failed to load certs", zap.Error(err))
+			logging.Error("Failed to load server certs", zap.Error(err))
 			return
 		}
-		inboundConn = tls.Server(clientConn, &tls.Config{Certificates: []tls.Certificate{cert}})
+
+		serverTLSConfig := &tls.Config{
+			Certificates: []tls.Certificate{serverCert},
+		}
+
+		// If CA file is provided, enable client certificate verification (mTLS)
+		if config.CAFile != "" {
+			caPool, err := loadCAPool(config.CAFile)
+			if err != nil {
+				logging.Error("Failed to load CA pool for client verification", zap.Error(err))
+				return
+			}
+			serverTLSConfig.ClientCAs = caPool
+			serverTLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+			logging.Debug("Inbound mTLS: client cert verification enabled", zap.String("connID", connID))
+		}
+
+		inboundConn = tls.Server(clientConn, serverTLSConfig)
 
 		// B. Connect Outbound (Proxy -> Target) as TLS Client
-		// InsecureSkipVerify=true for testing (matches your dev environment)
-		outboundConn, err = tls.Dial("tcp", targetAddr, &tls.Config{InsecureSkipVerify: true})
+		clientTLSConfig := &tls.Config{
+			InsecureSkipVerify: config.TLSSkipVerify,
+		}
+
+		// If client cert/key are provided, present them for mTLS authentication
+		if config.ClientCertFile != "" && config.ClientKeyFile != "" {
+			clientCert, err := tls.LoadX509KeyPair(config.ClientCertFile, config.ClientKeyFile)
+			if err != nil {
+				logging.Error("Failed to load client certs for outbound", zap.Error(err))
+				return
+			}
+			clientTLSConfig.Certificates = []tls.Certificate{clientCert}
+			logging.Debug("Outbound mTLS: presenting client cert", zap.String("connID", connID))
+		}
+
+		outboundConn, err = tls.Dial("tcp", targetAddr, clientTLSConfig)
 		if err != nil {
 			logging.Warn("Failed to connect to target (TLS)", zap.Error(err))
 			return
