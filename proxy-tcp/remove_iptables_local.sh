@@ -18,7 +18,11 @@ sudo iptables -t nat -D PREROUTING -m conntrack --ctstate RELATED,ESTABLISHED -j
 sudo iptables -t nat -D OUTPUT -p tcp --dport 53 -j RETURN 2>/dev/null
 sudo iptables -t nat -D OUTPUT -p udp --dport 53 -j RETURN 2>/dev/null
 
-# Remove loopback exclusion rule
+# Remove loopback exclusion rules (new specific rules for proxy ports)
+sudo iptables -t nat -D OUTPUT -o lo -p tcp --dport 15006 -j RETURN 2>/dev/null
+sudo iptables -t nat -D OUTPUT -o lo -p tcp --dport 15002 -j RETURN 2>/dev/null
+
+# Remove old loopback exclusion rule (if it exists)
 sudo iptables -t nat -D OUTPUT -o lo -j RETURN 2>/dev/null
 
 # Remove proxy user exclusion rule
