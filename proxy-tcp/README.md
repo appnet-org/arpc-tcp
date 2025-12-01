@@ -74,7 +74,7 @@ go build -o proxy-tcp .
 
 ```bash
 # Run with iptables interception (recommended)
-sudo -u proxyuser ./proxy-tcp -tls -tls-cert-file=../benchmark/kv-store/certs/server-cert.pem -tls-key-file=../benchmark/kv-store/certs/server-key.pem
+sudo -u proxyuser ./proxy-tcp -mtls -tls-cert-file=../benchmark/kv-store/certs/server-cert.pem -tls-key-file=../benchmark/kv-store/certs/server-key.pem
 ```
 
 ## Cleanup
