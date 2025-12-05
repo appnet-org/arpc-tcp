@@ -15,7 +15,8 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/appnet-org/arpc/pkg/logging"
+	"github.com/appnet-org/arpc-tcp/pkg/logging"
+	"github.com/appnet-org/arpc-tcp/pkg/transport"
 	"github.com/appnet-org/proxy-tcp/element"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
@@ -49,6 +50,8 @@ type Config struct {
 	ClientCertFile string // Client cert for outbound (proxy acts as client)
 	ClientKeyFile  string // Client key for outbound
 	TLSSkipVerify  bool   // Skip server certificate verification on outbound
+	// Buffering Configuration
+	BufferingEnabled bool
 }
 
 // DefaultConfig returns the default proxy configuration
@@ -185,6 +188,7 @@ func main() {
 		tlsClientCertFile = flag.String("tls-client-cert-file", "", "Client cert file (for authenticating to upstream in mTLS)")
 		tlsClientKeyFile  = flag.String("tls-client-key-file", "", "Client key file (for authenticating to upstream in mTLS)")
 		tlsSkipVerify     = flag.Bool("tls-skip-verify", true, "Skip server certificate verification on outbound connections (insecure, for testing only)")
+		bufferingEnabled  = flag.Bool("buffering", false, "Enable buffering mode (buffer packets until complete RPC message)")
 	)
 	flag.Parse()
 
@@ -196,15 +200,16 @@ func main() {
 
 	// 2. Populate Config
 	config := &Config{
-		Ports:          []int{15002, 15006},
-		TargetAddr:     os.Getenv("TARGET_ADDR"),
-		TLSEnabled:     *tlsEnabled || *enableMTLS,
-		CertFile:       *tlsCertFile,
-		KeyFile:        *tlsKeyFile,
-		CAFile:         *tlsCAFile,
-		ClientCertFile: *tlsClientCertFile,
-		ClientKeyFile:  *tlsClientKeyFile,
-		TLSSkipVerify:  *tlsSkipVerify,
+		Ports:            []int{15002, 15006},
+		TargetAddr:       os.Getenv("TARGET_ADDR"),
+		TLSEnabled:       *tlsEnabled || *enableMTLS,
+		CertFile:         *tlsCertFile,
+		KeyFile:          *tlsKeyFile,
+		CAFile:           *tlsCAFile,
+		ClientCertFile:   *tlsClientCertFile,
+		ClientKeyFile:    *tlsClientKeyFile,
+		TLSSkipVerify:    *tlsSkipVerify,
+		BufferingEnabled: *bufferingEnabled,
 	}
 
 	if config.TLSEnabled {
@@ -230,6 +235,12 @@ func main() {
 		}
 	} else {
 		logging.Info("TLS Termination DISABLED (Blind Forwarding)")
+	}
+
+	if config.BufferingEnabled {
+		logging.Info("Buffering Mode ENABLED (Wait for complete RPC)")
+	} else {
+		logging.Info("Buffering Mode DISABLED (Streaming)")
 	}
 
 	logging.Info("Starting bidirectional TCP proxy on :15002 and :15006...")
@@ -409,12 +420,12 @@ func handleConnection(clientConn net.Conn, state *ProxyState, config *Config) {
 
 	go func() {
 		defer wg.Done()
-		handleTCPStream(inboundConn, outboundConn, state, ctx, true, connID, targetAddr)
+		handleTCPStream(inboundConn, outboundConn, state, ctx, true, connID, targetAddr, config.BufferingEnabled)
 	}()
 
 	go func() {
 		defer wg.Done()
-		handleTCPStream(outboundConn, inboundConn, state, ctx, false, connID, targetAddr)
+		handleTCPStream(outboundConn, inboundConn, state, ctx, false, connID, targetAddr, config.BufferingEnabled)
 	}()
 
 	wg.Wait()
@@ -468,7 +479,12 @@ func processDataThroughElementChain(ctx context.Context, state *ProxyState, conn
 }
 
 // handleTCPStream processes TCP data in one direction
-func handleTCPStream(srcConn net.Conn, dstConn io.Writer, state *ProxyState, ctx context.Context, isRequest bool, connID, targetAddr string) {
+func handleTCPStream(srcConn net.Conn, dstConn net.Conn, state *ProxyState, ctx context.Context, isRequest bool, connID, targetAddr string, buffering bool) {
+	if buffering {
+		handleBufferedTCPStream(srcConn, dstConn, state, ctx, isRequest, connID, targetAddr)
+		return
+	}
+
 	buffer := make([]byte, DefaultBufferSize)
 	direction := "request"
 	if !isRequest {
@@ -535,6 +551,89 @@ func handleTCPStream(srcConn net.Conn, dstConn io.Writer, state *ProxyState, ctx
 				zap.Int("dataLen", len(processedData)),
 				zap.String("payload", string(processedData)))
 		}
+	}
+}
+
+// handleBufferedTCPStream processes TCP data in buffering mode (waiting for full RPC)
+func handleBufferedTCPStream(srcConn net.Conn, dstConn net.Conn, state *ProxyState, ctx context.Context, isRequest bool, connID, targetAddr string) {
+	direction := "request"
+	if !isRequest {
+		direction = "response"
+	}
+
+	// Create TCPTransports to handle the framing, reassembly, and fragmentation
+	// We use NewTCPTransportForConnection to wrap existing connections (acting as Server mode to avoid dial)
+	// For logging/logic purposes:
+	// - srcTrans receives data from srcConn
+	// - dstTrans sends data to dstConn
+	srcTrans := transport.NewTCPTransportForConnection(srcConn, nil)
+	dstTrans := transport.NewTCPTransportForConnection(dstConn, nil)
+
+	// Ensure transports are closed when function exits
+	defer srcTrans.Close()
+	defer dstTrans.Close()
+
+	// Use a large enough buffer for receiving packets
+	// 65536 covers MaxTCPPayloadSize + headers
+	const ReceiveBufferSize = 65536
+
+	for {
+		// Receive attempts to read a packet and reassemble fragments
+		// It returns data only when a complete RPC message is available (or an error packet)
+		data, _, rpcID, pktType, err := srcTrans.Receive(ReceiveBufferSize)
+		if err != nil {
+			if err != io.EOF {
+				logging.Debug("Receive error",
+					zap.String("connID", connID),
+					zap.String("direction", direction),
+					zap.Error(err))
+			}
+			return
+		}
+
+		// If data is nil, it means we processed a fragment but still waiting for more.
+		// Continue loop.
+		if data == nil {
+			continue
+		}
+
+		logging.Debug("Received Complete RPC Message",
+			zap.String("connID", connID),
+			zap.String("direction", direction),
+			zap.Uint64("rpcID", rpcID),
+			zap.Int("dataLen", len(data)))
+
+		// Process complete RPC message through element chain
+		verdict, processedData, shouldForward := processDataThroughElementChain(
+			ctx, state, connID, data, isRequest,
+			srcConn.RemoteAddr().String(), targetAddr)
+
+		if !shouldForward {
+			logging.Debug("RPC Message dropped by element chain",
+				zap.String("connID", connID),
+				zap.String("direction", direction),
+				zap.Uint64("rpcID", rpcID),
+				zap.String("verdict", verdict.String()))
+			continue
+		}
+
+		// Send the processed message
+		// This handles fragmentation automatically inside transport.Send
+		// We pass targetAddr string, though strictly it's ignored because dstTrans is in Server mode (has conn)
+		if err := dstTrans.Send(targetAddr, rpcID, processedData, pktType); err != nil {
+			logging.Error("Send error",
+				zap.String("connID", connID),
+				zap.String("direction", direction),
+				zap.Uint64("rpcID", rpcID),
+				zap.Error(err))
+			return
+		}
+
+		logging.Debug("Forwarded RPC Message",
+			zap.String("connID", connID),
+			zap.String("direction", direction),
+			zap.Uint64("rpcID", rpcID),
+			zap.Int("dataLen", len(processedData)))
 	}
 }
 
