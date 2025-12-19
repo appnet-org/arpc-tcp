@@ -577,6 +577,9 @@ func handleBufferedTCPStream(srcConn net.Conn, dstConn net.Conn, state *ProxySta
 	// 65536 covers MaxTCPPayloadSize + headers
 	const ReceiveBufferSize = 65536
 
+	// Track packet count per RPC message
+	packetCount := 0
+
 	for {
 		// Receive attempts to read a packet and reassemble fragments
 		// It returns data only when a complete RPC message is available (or an error packet)
@@ -591,17 +594,25 @@ func handleBufferedTCPStream(srcConn net.Conn, dstConn net.Conn, state *ProxySta
 			return
 		}
 
+		// Increment packet count for each Receive() call (each packet read)
+		packetCount++
+
 		// If data is nil, it means we processed a fragment but still waiting for more.
 		// Continue loop.
 		if data == nil {
 			continue
 		}
 
+		// Log complete message with packet count, then reset counter for next message
 		logging.Debug("Received Complete RPC Message",
 			zap.String("connID", connID),
 			zap.String("direction", direction),
 			zap.Uint64("rpcID", rpcID),
-			zap.Int("dataLen", len(data)))
+			zap.Int("dataLen", len(data)),
+			zap.Int("packetCount", packetCount))
+
+		// Reset packet count for the next RPC message
+		packetCount = 0
 
 		// Process complete RPC message through element chain
 		verdict, processedData, shouldForward := processDataThroughElementChain(
