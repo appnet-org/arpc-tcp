@@ -128,7 +128,7 @@ func main() {
 		tlsClientCertFile = flag.String("tls-client-cert-file", "", "Path to client certificate file (required for mTLS)")
 		tlsClientKeyFile  = flag.String("tls-client-key-file", "", "Path to client private key file (required for mTLS)")
 		tlsSkipVerify     = flag.Bool("tls-skip-verify", true, "Skip server certificate verification (testing only)")
-		serverAddr        = flag.String("server", "kvstore.default.svc.cluster.local:11000", "Server address to connect to")
+		serverAddr        = flag.String("server", ":11000", "Server address to connect to")
 	)
 	flag.Parse()
 
